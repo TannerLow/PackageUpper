@@ -11,6 +11,20 @@ PackageUpper lives only in this repository. The repositories it acts on hold jus
 - Python 3.10 or newer
 - `git` on the `PATH`, with access to the repositories you depend on
 
+## Usage
+
+Clone this repository anywhere, then run `packageupper.py` from the project that has a `packageupper.txt`:
+
+```bash
+python path/to/PackageUpper/packageupper.py install
+```
+
+```bash
+python path/to/PackageUpper/packageupper.py clean
+```
+
+Both commands take `--project <folder>` to act on a project other than the current folder. Commit `deps/` along with your changes to `packageupper.txt`.
+
 ## Metadata file
 
 Every repository PackageUpper acts on has a `packageupper.txt` at its root. It is plain text, one entry per line; blank lines and lines starting with `#` are ignored.
@@ -28,7 +42,7 @@ local    https://github.com/TannerLow/SomeLib/tree/<full commit sha>
 
 - `include`, `src`, `external`: paths, relative to the repository root, that get copied when the repository is used as a dependency. A project that is never depended on, like a game, needs none of them
 - `dep`: a dependency, as a GitHub tree URL pinned to a full 40-character commit SHA. Branch names and short SHAs are errors
-- `local`: a dependency you are editing in place. Its copy in `deps/` is never deleted or overwritten. It still takes part in dependency resolution, using the copy already in `deps/`
+- `local`: a dependency you are editing in place. Its copy in `deps/` is never deleted or overwritten. It still takes part in dependency resolution, using the copy already in `deps/`, including its `packageupper.txt`, so edits to that file count. If it isn't in `deps/` yet, `install` fetches it once. `local` only has an effect in the project's own `packageupper.txt`; in a dependency's file it counts as `dep`
 
 ## Fetching
 
@@ -45,13 +59,14 @@ This way private repositories work with whatever credentials git already has on 
 ## Resolution
 
 - Repositories are identified by `owner/repo`, lowercased, because GitHub ignores case
+- Each dependency is installed into `deps/<repo>`, so two dependencies with the same repository name from different owners are an error
 - The same repository at the same commit, reached through two paths, is fetched once
 - The same repository at two different commits is an error. The message lists every path that leads to each commit, for example `o2jam@9cdc757 via App` and `o2jam@41af0e2 via App -> O2Gui`, so you know which repository to update. PackageUpper never picks a commit itself
 - `local` dependencies are checked the same way, using the commit on their `local` line. If another repository in the tree needs a different commit, that is an error, so a `local` dependency can't silently fall out of date
 
 ## Output
 
-Each dependency is copied into its own folder in the project that uses it, under `deps/`, keeping the exported paths' last folder names:
+Each dependency is copied into its own folder in the project that uses it, under `deps/`. `include` and `src` paths keep their last folder name, and `external` paths go under `externals/`:
 
 ```
 deps/
@@ -75,6 +90,16 @@ deps/
 
 ## Errors
 
-When something is wrong, PackageUpper says what and what to do about it, then exits with a non-zero status. Errors about a `packageupper.txt` name the file and line number, for example `deps/O2Gui/packageupper.txt:7: "tree/main" is not a full commit SHA`.
+When something is wrong, PackageUpper says what and what to do about it, then exits with a non-zero status. Errors about a `packageupper.txt` name the file and line number. A file in your project is named by its path, for example `deps/O2Gui/packageupper.txt:7: "main" is not a full commit SHA`. A file in a fetched repository is named by the repository and commit it came from, for example `TannerLow/O2Gui@7e040c9/packageupper.txt:7`.
 
 A failed run leaves `deps/` exactly as it was: everything is resolved and fetched before `deps/` is touched.
+
+## Development
+
+Run the tests from the repository root:
+
+```bash
+python -m unittest discover tests
+```
+
+The tests build throwaway git repositories in a temporary folder and point PackageUpper at them instead of GitHub, so they run offline.
