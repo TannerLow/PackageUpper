@@ -29,11 +29,15 @@ URL_PATTERN = re.compile(
 SHA_PATTERN = re.compile(r"^[0-9a-fA-F]{40}$")
 
 EXPORT_KINDS = ("include", "src", "external")
+DEP_KINDS = ("dep", "local")
+BUILD_KINDS = ("link", "copy", "syslib")
+
+# Visual Studio platform names a link, copy or syslib line can be limited to
+PLATFORMS = ("Win32", "x64", "ARM", "ARM64")
 
 # File types deps.props lists for Visual Studio
 SOURCE_EXTENSIONS = (".c", ".cc", ".cpp", ".cxx")
 HEADER_EXTENSIONS = (".h", ".hh", ".hpp", ".hxx", ".inl")
-DEP_KINDS = ("dep", "local")
 
 
 # ---------------------------------------------------------------------------
@@ -57,10 +61,19 @@ class DepRef:
 
 
 @dataclass
+class BuildEntry:
+    kind: str          # "link", "copy" or "syslib"
+    value: str         # for link and copy, a path relative to the repository root; for syslib, a library name
+    platform: str      # a name from PLATFORMS, or "" for every platform
+    line: int
+
+
+@dataclass
 class Manifest:
     display_path: str  # how errors name this file
     exports: list = field(default_factory=list)  # list of Export
     deps: list = field(default_factory=list)     # list of DepRef
+    build: list = field(default_factory=list)    # list of BuildEntry
 
 
 @dataclass
@@ -134,6 +147,66 @@ def export_target(kind: str, path: str) -> str:
     return name
 
 
+def parse_build_entry(
+    kind: str,
+    value: str,
+    display_path: str,
+    line: int
+) -> BuildEntry:
+    words = value.split()
+    if len(words) > 2:
+        raise UserError(
+            f"{display_path}:{line}: \"{kind}\" takes a path and an optional platform. "
+            f"Paths with spaces aren't supported here"
+        )
+    path = words[0]
+    platform = ""
+    if len(words) == 2:
+        platform = words[1]
+        if platform not in PLATFORMS:
+            hint = ""
+            if platform.lower() in ("x86", "win32"):
+                hint = " Use Win32 for 32-bit builds."
+            raise UserError(
+                f"{display_path}:{line}: unknown platform \"{platform}\". "
+                f"Expected one of: {', '.join(PLATFORMS)}.{hint}"
+            )
+
+    if kind == "syslib":
+        if "/" in path or "\\" in path or not path.lower().endswith(".lib"):
+            raise UserError(
+                f"{display_path}:{line}: \"{path}\" should be the name of a .lib that comes with "
+                f"Windows, like winmm.lib. Use \"link\" for a .lib in the repository"
+            )
+        return BuildEntry(kind=kind, value=path, platform=platform, line=line)
+
+    path = check_export_path(path, display_path, line)
+    extension = ".lib" if kind == "link" else ".dll"
+    if not path.lower().endswith(extension):
+        raise UserError(f"{display_path}:{line}: \"{kind}\" takes a {extension} file, not \"{path}\"")
+    return BuildEntry(kind=kind, value=path, platform=platform, line=line)
+
+
+def find_external(
+    manifest: Manifest,
+    path: str
+) -> Export:
+    """The external export that contains path, or None."""
+    for export in manifest.exports:
+        if export.kind == "external" and (path == export.path or path.startswith(export.path + "/")):
+            return export
+    return None
+
+
+def path_in_deps(
+    manifest: Manifest,
+    path: str
+) -> str:
+    """Where a link or copy path from the repository ends up inside deps/<repo>."""
+    export = find_external(manifest, path)
+    return export_target(export.kind, export.path) + path[len(export.path):]
+
+
 def parse_manifest(text: str, display_path: str) -> Manifest:
     manifest = Manifest(display_path=display_path)
     export_names = {}
@@ -165,10 +238,20 @@ def parse_manifest(text: str, display_path: str) -> Manifest:
             manifest.deps.append(
                 DepRef(kind=kind, owner=owner, repo=repo, sha=sha, line=line_number)
             )
+        elif kind in BUILD_KINDS:
+            manifest.build.append(parse_build_entry(kind, value, display_path, line_number))
         else:
             raise UserError(
                 f"{display_path}:{line_number}: unknown entry \"{kind}\". "
-                f"Expected one of: {', '.join(EXPORT_KINDS + DEP_KINDS)}"
+                f"Expected one of: {', '.join(EXPORT_KINDS + DEP_KINDS + BUILD_KINDS)}"
+            )
+
+    # Checked after the whole file, so link and copy lines can come before their external line
+    for entry in manifest.build:
+        if entry.kind != "syslib" and find_external(manifest, entry.value) is None:
+            raise UserError(
+                f"{display_path}:{entry.line}: \"{entry.value}\" is not inside an exported external. "
+                f"Add an \"external\" line for the folder that holds it"
             )
     return manifest
 
@@ -374,8 +457,8 @@ def msbuild_escape(text: str) -> str:
     return text
 
 
-def windows_path(relative: Path) -> str:
-    return "\\".join(relative.parts)
+def windows_path(relative: str) -> str:
+    return relative.replace("/", "\\")
 
 
 def files_with_extensions(
@@ -389,37 +472,66 @@ def files_with_extensions(
     return found
 
 
-def write_props(
-    deps_dir: Path,
-    log
-) -> None:
-    """Writes deps/deps.props from what is in deps/ now: every dependency's
-    include paths, source files and headers, for a .vcxproj to import."""
-    include_dirs = []  # paths relative to deps/
+def build_props(folders: list) -> tuple:
+    """Builds the text of deps/deps.props. folders is a list of
+    (name, source_dir, display_path): each dependency's folder name in deps/,
+    where its files are right now, which is a staging folder during install,
+    and how errors name its packageupper.txt. Returns (text, summary).
+
+    Raises UserError for a link or copy file that is missing, or two DLLs that
+    would be copied to the same name, so install can stop before touching deps/."""
+    include_dirs = []  # paths relative to deps/, using "/"
     sources = []
     headers = []
+    links = {}         # platform ("" for every platform) -> list of values for AdditionalDependencies
+    copies = {}        # platform -> list of paths relative to deps/
+    copy_names = []    # (file name, platform, display_path, line), to find two DLLs with the same name
 
-    for package_dir in sorted(deps_dir.iterdir(), key=lambda entry: entry.name.lower()):
-        manifest_path = package_dir / MANIFEST_NAME
-        if not package_dir.is_dir() or not manifest_path.is_file():
-            continue
-        manifest = read_manifest(manifest_path, f"{DEPS_NAME}/{package_dir.name}/{MANIFEST_NAME}")
+    for name, source_dir, display_path in folders:
+        manifest = read_manifest(source_dir / MANIFEST_NAME, display_path)
         for export in manifest.exports:
-            target = package_dir / export_target(export.kind, export.path)
+            target_name = export_target(export.kind, export.path)
+            target = source_dir / target_name
             if not target.is_dir():
                 continue
             if export.kind == "include":
-                include_dirs.append(target.relative_to(deps_dir))
-                headers.extend(files_with_extensions(target, HEADER_EXTENSIONS))
+                include_dirs.append(f"{name}/{target_name}")
+                for path in files_with_extensions(target, HEADER_EXTENSIONS):
+                    headers.append(f"{name}/{path.relative_to(source_dir).as_posix()}")
             elif export.kind == "src":
-                sources.extend(files_with_extensions(target, SOURCE_EXTENSIONS))
-                headers.extend(files_with_extensions(target, HEADER_EXTENSIONS))
+                for path in files_with_extensions(target, SOURCE_EXTENSIONS):
+                    sources.append(f"{name}/{path.relative_to(source_dir).as_posix()}")
+                for path in files_with_extensions(target, HEADER_EXTENSIONS):
+                    headers.append(f"{name}/{path.relative_to(source_dir).as_posix()}")
             elif export.kind == "external":
                 # An external's headers are found by the include/ folder convention
                 if (target / "include").is_dir():
-                    include_dirs.append((target / "include").relative_to(deps_dir))
+                    include_dirs.append(f"{name}/{target_name}/include")
 
-    here = "$(MSBuildThisFileDirectory)"
+        for entry in manifest.build:
+            if entry.platform not in links:
+                links[entry.platform] = []
+                copies[entry.platform] = []
+            if entry.kind == "syslib":
+                links[entry.platform].append(msbuild_escape(entry.value))
+                continue
+            inside = path_in_deps(manifest, entry.value)
+            if not (source_dir / inside).is_file():
+                raise UserError(f"{display_path}:{entry.line}: \"{entry.value}\" does not exist")
+            if entry.kind == "link":
+                links[entry.platform].append(here_path(f"{name}/{inside}"))
+            else:
+                file_name = inside.split("/")[-1].lower()
+                for other_name, other_platform, other_path, other_line in copy_names:
+                    overlap = entry.platform == "" or other_platform == "" or entry.platform == other_platform
+                    if other_name == file_name and overlap:
+                        raise UserError(
+                            f"{display_path}:{entry.line}: \"{file_name}\" would be copied next to the "
+                            f"executable by {other_path}:{other_line} too. Only one dependency can provide it"
+                        )
+                copy_names.append((file_name, entry.platform, display_path, entry.line))
+                copies[entry.platform].append(f"{name}/{inside}")
+
     lines = [
         '<?xml version="1.0" encoding="utf-8"?>',
         f"<!-- Generated by PackageUpper from {DEPS_NAME}/. Don't edit: install and clean rewrite it. -->",
@@ -429,34 +541,93 @@ def write_props(
     ]
     include_value = ""
     for folder in include_dirs:
-        include_value += here + msbuild_escape(windows_path(folder)) + ";"
+        include_value += here_path(folder) + ";"
     lines.append(f"      <AdditionalIncludeDirectories>{include_value}%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>")
     lines.append("    </ClCompile>")
     lines.append("  </ItemDefinitionGroup>")
 
+    # "" (every platform) first, then each platform by name
+    platforms = sorted(links.keys())
+    for platform in platforms:
+        if len(links[platform]) == 0:
+            continue
+        lines.append(f"  <ItemDefinitionGroup{platform_condition(platform)}>")
+        lines.append("    <Link>")
+        lines.append(f"      <AdditionalDependencies>{';'.join(links[platform])};%(AdditionalDependencies)</AdditionalDependencies>")
+        lines.append("    </Link>")
+        lines.append("  </ItemDefinitionGroup>")
+
     lines.append("  <ItemGroup>")
     for source in sources:
-        relative = source.relative_to(deps_dir)
         # Object files keep their folders, so two .cpp files with the same name don't
         # overwrite each other's .obj. Set per file, because these paths are absolute.
-        object_dir = f"$(IntDir){DEPS_NAME}\\" + msbuild_escape(windows_path(relative.parent)) + "\\"
-        lines.append(f'    <ClCompile Include="{here}{msbuild_escape(windows_path(relative))}">')
+        folder = source.rsplit("/", 1)[0]
+        object_dir = f"$(IntDir){DEPS_NAME}\\" + msbuild_escape(windows_path(folder)) + "\\"
+        lines.append(f'    <ClCompile Include="{here_path(source)}">')
         lines.append(f"      <ObjectFileName>{object_dir}</ObjectFileName>")
         lines.append("    </ClCompile>")
     for header in headers:
-        relative = header.relative_to(deps_dir)
-        lines.append(f'    <ClInclude Include="{here}{msbuild_escape(windows_path(relative))}" />')
+        lines.append(f'    <ClInclude Include="{here_path(header)}" />')
     lines.append("  </ItemGroup>")
+
+    copy_count = 0
+    for platform in platforms:
+        if len(copies[platform]) == 0:
+            continue
+        lines.append(f"  <ItemGroup{platform_condition(platform)}>")
+        for path in copies[platform]:
+            lines.append(f'    <PackageUpperCopy Include="{here_path(path)}" />')
+            copy_count += 1
+        lines.append("  </ItemGroup>")
+    lines.append("  <!-- Copies the dependencies' DLLs next to the executable after each build -->")
+    lines.append('  <Target Name="PackageUpperCopy" AfterTargets="Build">')
+    lines.append('    <Copy SourceFiles="@(PackageUpperCopy)" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />')
+    lines.append("  </Target>")
     lines.append("</Project>")
 
+    link_count = 0
+    for platform in platforms:
+        link_count += len(links[platform])
+    summary = (
+        f"{len(sources)} source files, {len(include_dirs)} include folders, "
+        f"{link_count} libraries, {copy_count} DLLs"
+    )
+    return "\n".join(lines) + "\n", summary
+
+
+def here_path(relative: str) -> str:
+    """A path relative to deps/, as deps.props refers to it."""
+    return "$(MSBuildThisFileDirectory)" + msbuild_escape(windows_path(relative))
+
+
+def platform_condition(platform: str) -> str:
+    if platform == "":
+        return ""
+    return f" Condition=\"'$(Platform)'=='{platform}'\""
+
+
+def write_props(
+    deps_dir: Path,
+    text: str,
+    summary: str,
+    log
+) -> None:
     # newline="\n" so the file is the same whichever OS ran the install
-    (deps_dir / PROPS_NAME).write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
-    log(f"Wrote {DEPS_NAME}/{PROPS_NAME} ({len(sources)} source files, {len(include_dirs)} include folders)")
+    (deps_dir / PROPS_NAME).write_text(text, encoding="utf-8", newline="\n")
+    log(f"Wrote {DEPS_NAME}/{PROPS_NAME} ({summary})")
 
 
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
+
+def package_sort_key(package: Package) -> str:
+    return package.repo.lower()
+
+
+def folder_sort_key(folder: Path) -> str:
+    return folder.name.lower()
+
 
 def local_folder_names(project_dir: Path) -> set:
     root = read_manifest(project_dir / MANIFEST_NAME, MANIFEST_NAME)
@@ -486,6 +657,15 @@ def install(
                 continue
             copy_exports(package, staging_dir / package.repo)
 
+        # Built before deps/ is touched, so its errors also leave deps/ as it was
+        folders = []
+        for package in sorted(packages, key=package_sort_key):
+            if package.is_local and package.source_dir == deps_dir / package.repo:
+                folders.append((package.repo, package.source_dir, package.manifest.display_path))
+            else:
+                folders.append((package.repo, staging_dir / package.repo, package.manifest.display_path))
+        props_text, props_summary = build_props(folders)
+
         deps_dir.mkdir(exist_ok=True)
         wanted = set()
         for package in packages:
@@ -507,7 +687,7 @@ def install(
             shutil.move(str(staging_dir / package.repo), str(target))
             log(f"Installed {DEPS_NAME}/{package.repo} ({package.sha[:7]})")
 
-        write_props(deps_dir, log)
+        write_props(deps_dir, props_text, props_summary, log)
     finally:
         remove_tree(fetch_dir)
 
@@ -520,6 +700,14 @@ def clean(
     local_names = local_folder_names(project_dir)
     if not deps_dir.is_dir():
         return
+
+    # deps.props for what will be left, built first so its errors leave deps/ as it was
+    kept = []
+    for entry in sorted(deps_dir.iterdir(), key=folder_sort_key):
+        if entry.is_dir() and entry.name.lower() in local_names and (entry / MANIFEST_NAME).is_file():
+            kept.append((entry.name, entry, f"{DEPS_NAME}/{entry.name}/{MANIFEST_NAME}"))
+    props_text, props_summary = build_props(kept)
+
     for entry in sorted(deps_dir.iterdir()):
         if not entry.is_dir():
             continue
@@ -529,7 +717,7 @@ def clean(
         log(f"Removing {DEPS_NAME}/{entry.name}")
         remove_tree(entry)
 
-    write_props(deps_dir, log)
+    write_props(deps_dir, props_text, props_summary, log)
 
 
 def main(argv: list) -> int:

@@ -33,7 +33,14 @@ Every repository PackageUpper acts on has a `packageupper.txt` at its root. It i
 # What this repository exports when another project depends on it
 include  O2Jam/include
 src      O2Jam/src
-external O2Jam/externals/BASS
+external externals/BASS
+
+# What a project that depends on this repository must link, and the DLLs it needs
+link     externals/BASS/lib/x64/bass.lib  x64
+link     externals/BASS/lib/x86/bass.lib  Win32
+copy     externals/BASS/lib/x64/bass.dll  x64
+copy     externals/BASS/lib/x86/bass.dll  Win32
+syslib   winmm.lib
 
 # What this repository depends on
 dep      https://github.com/TannerLow/O2Gui/tree/<full commit sha>
@@ -41,6 +48,10 @@ local    https://github.com/TannerLow/SomeLib/tree/<full commit sha>
 ```
 
 - `include`, `src`, `external`: paths, relative to the repository root, that get copied when the repository is used as a dependency. A project that is never depended on, like a game, needs none of them
+- `link`: a `.lib` file in the repository that projects depending on it must link, as a path relative to the repository root
+- `copy`: a `.dll` file in the repository that must sit next to a depending project's executable
+- `syslib`: a `.lib` that comes with Windows, like `winmm.lib`, by name only
+- `link`, `copy` and `syslib` take an optional Visual Studio platform after the path: `Win32`, `x64`, `ARM` or `ARM64`. Without one, the line applies to every platform. The paths of `link` and `copy` must be inside an `external` path, since only exported paths are copied, and can't contain spaces. They apply to every project that depends on the repository, directly or through other dependencies
 - `dep`: a dependency, as a GitHub tree URL pinned to a full 40-character commit SHA. Branch names and short SHAs are errors
 - `local`: a dependency you are editing in place. Its copy in `deps/` is never deleted or overwritten. It still takes part in dependency resolution, using the copy already in `deps/`, including its `packageupper.txt`, so edits to that file count. If it isn't in `deps/` yet, `install` fetches it once. `local` only has an effect in the project's own `packageupper.txt`; in a dependency's file it counts as `dep`
 
@@ -93,19 +104,23 @@ deps/
 - every `.c`, `.cc`, `.cpp` and `.cxx` file under each `src` path, compiled
 - every `.h`, `.hh`, `.hpp`, `.hxx` and `.inl` file under each `include` and `src` path, listed as a header
 - each source file's object file under `$(IntDir)deps\<repo>\...`, keeping its folders, so two `.cpp` files with the same name don't overwrite each other's `.obj`
+- every `link` and `syslib` line, linked, for the platform it names
+- every `copy` line, copied next to the executable after each build, for the platform it names. Two dependencies that copy a DLL with the same name to the same platform are an error
 
 The file is rebuilt from what is in `deps/` on every run, so files a dependency adds or removes, including in a `local` dependency, are picked up without editing the project. Every file is listed by name, because Visual Studio doesn't support wildcards in project items.
 
-Import it once in the `.vcxproj`, right after the line that imports `Microsoft.Cpp.props`, with the path from the `.vcxproj` to `deps/`:
+Import it once in the project. In Visual Studio, open **View > Property Manager** (or **View > Other Windows > Property Manager**), right-click the project, choose **Add Existing Property Sheet...**, pick `deps\deps.props`, and save. That adds it to every configuration.
+
+Or edit the `.vcxproj` by hand: add this right after the line that imports `Microsoft.Cpp.props`, with the path from the `.vcxproj` to `deps/`. The condition lets the project load before the first install:
 
 ```xml
 <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
 <Import Project="deps\deps.props" Condition="exists('deps\deps.props')" />
 ```
 
-- If the project sets its own include directories, keep `%(AdditionalIncludeDirectories)` in them, which Visual Studio's property pages do by default, so the dependencies' folders stay on the path
+- If the project sets its own include directories or libraries, keep `%(AdditionalIncludeDirectories)` and `%(AdditionalDependencies)` in them, which Visual Studio's property pages do by default, so the dependencies' settings still apply
 - The files show up at the top level of the project in Solution Explorer, because filters live in the project's own `.vcxproj.filters`, which PackageUpper doesn't write
-- Libraries to link and DLLs to copy are not in `deps.props` yet; set those in the project
+- Visual Studio may keep using the old file list after `install` or `clean` while the solution is open. If a build looks for files that are gone, unload and reload the project
 
 ## Commands
 
