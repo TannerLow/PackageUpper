@@ -70,6 +70,7 @@ Each dependency is copied into its own folder in the project that uses it, under
 
 ```
 deps/
+    deps.props
     O2Jam/
         packageupper.txt
         include/o2/jam/...
@@ -82,11 +83,34 @@ deps/
 - Each dependency's `packageupper.txt` is copied too, so `local` dependencies can be resolved without fetching
 - `deps/` is meant to be committed to the project's repository, so the project builds and can be read without running PackageUpper
 - PackageUpper owns `deps/` and nothing else in the project: it never writes outside `deps/`
+- `deps.props` is generated for Visual Studio; see below
+
+## Visual Studio
+
+`install` and `clean` write `deps/deps.props`, an MSBuild file that adds every dependency in `deps/` to a Visual Studio project:
+
+- each `include` path, and the `include/` folder of each `external` that has one, on the include path
+- every `.c`, `.cc`, `.cpp` and `.cxx` file under each `src` path, compiled
+- every `.h`, `.hh`, `.hpp`, `.hxx` and `.inl` file under each `include` and `src` path, listed as a header
+- each source file's object file under `$(IntDir)deps\<repo>\...`, keeping its folders, so two `.cpp` files with the same name don't overwrite each other's `.obj`
+
+The file is rebuilt from what is in `deps/` on every run, so files a dependency adds or removes, including in a `local` dependency, are picked up without editing the project. Every file is listed by name, because Visual Studio doesn't support wildcards in project items.
+
+Import it once in the `.vcxproj`, right after the line that imports `Microsoft.Cpp.props`, with the path from the `.vcxproj` to `deps/`:
+
+```xml
+<Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+<Import Project="deps\deps.props" Condition="exists('deps\deps.props')" />
+```
+
+- If the project sets its own include directories, keep `%(AdditionalIncludeDirectories)` in them, which Visual Studio's property pages do by default, so the dependencies' folders stay on the path
+- The files show up at the top level of the project in Solution Explorer, because filters live in the project's own `.vcxproj.filters`, which PackageUpper doesn't write
+- Libraries to link and DLLs to copy are not in `deps.props` yet; set those in the project
 
 ## Commands
 
-- `install`: resolves the whole tree, then replaces every non-`local` dependency in `deps/` with a fresh copy and removes dependencies that are no longer in the tree
-- `clean`: deletes every non-`local` dependency from `deps/`
+- `install`: resolves the whole tree, then replaces every non-`local` dependency in `deps/` with a fresh copy, removes dependencies that are no longer in the tree, and rewrites `deps/deps.props`
+- `clean`: deletes every non-`local` dependency from `deps/` and rewrites `deps/deps.props` with what is left
 
 ## Errors
 

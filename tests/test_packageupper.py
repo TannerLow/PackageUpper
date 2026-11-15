@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import xml.dom.minidom
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -94,6 +95,12 @@ class PackageUpperTest(unittest.TestCase):
     def deps(self) -> Path:
         return self.project / "deps"
 
+    def dep_folders(self) -> list:
+        return sorted(p.name for p in self.deps().iterdir() if p.is_dir())
+
+    def props(self) -> str:
+        return (self.deps() / "deps.props").read_text(encoding="utf-8")
+
     def snapshot(self) -> dict:
         files = {}
         for path in sorted(self.deps().rglob("*")):
@@ -146,7 +153,7 @@ class PackageUpperTest(unittest.TestCase):
 
         self.install()
 
-        self.assertEqual(sorted(p.name for p in self.deps().iterdir()), ["A", "C"])
+        self.assertEqual(self.dep_folders(), ["A", "C"])
 
     def test_commit_conflict_lists_every_path_and_leaves_deps_alone(self) -> None:
         sha_c1 = self.library("C")
@@ -198,7 +205,7 @@ class PackageUpperTest(unittest.TestCase):
         self.set_project([f"dep {url('A', sha_a)}"])
         self.install()
 
-        self.assertEqual(sorted(p.name for p in self.deps().iterdir()), ["A"])
+        self.assertEqual(self.dep_folders(), ["A"])
 
     def test_install_replaces_edited_files_of_normal_dependencies(self) -> None:
         sha_a = self.library("A")
@@ -280,6 +287,89 @@ class PackageUpperTest(unittest.TestCase):
             f"dep https://github.com/someone/A/tree/{sha_a}",
         ])
         self.assert_error("packageupper.txt:2:", "deps/A")
+
+    # deps.props --------------------------------------------------------------
+
+    def test_props_lists_include_folders_sources_and_headers(self) -> None:
+        sha_b = self.library("B")
+        sha_a = self.commit("A", {
+            "packageupper.txt": "include A/include\nsrc A/src\nexternal ext/Lib\nexternal ext/NoHeaders\n",
+            "A/include/o2/a/a.h": "",
+            "A/include/o2/a/notes.txt": "",
+            "A/src/o2/a/a.cpp": "",
+            "A/src/o2/a/internal.hpp": "",
+            "A/src/o2/a/legacy.c": "",
+            "ext/Lib/include/lib.h": "",
+            "ext/Lib/lib/lib.lib": "",
+            "ext/NoHeaders/lib/x.lib": "",
+            "packageupper.txt.extra": "",
+        })
+        self.set_project([f"dep {url('A', sha_a)}", f"dep {url('B', sha_b)}"])
+        self.install()
+
+        props = self.props()
+        xml.dom.minidom.parseString(props)
+        here = "$(MSBuildThisFileDirectory)"
+        self.assertIn(
+            "<AdditionalIncludeDirectories>"
+            f"{here}A\\include;{here}A\\externals\\Lib\\include;"
+            f"{here}B\\include;"
+            "%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>",
+            props,
+        )
+        self.assertIn(f'<ClCompile Include="{here}A\\src\\o2\\a\\a.cpp">', props)
+        self.assertIn("<ObjectFileName>$(IntDir)deps\\A\\src\\o2\\a\\</ObjectFileName>", props)
+        self.assertIn(f'<ClCompile Include="{here}A\\src\\o2\\a\\legacy.c">', props)
+        self.assertIn(f'<ClCompile Include="{here}B\\src\\o2\\b\\b.cpp">', props)
+        self.assertIn(f'<ClInclude Include="{here}A\\include\\o2\\a\\a.h" />', props)
+        self.assertIn(f'<ClInclude Include="{here}A\\src\\o2\\a\\internal.hpp" />', props)
+        self.assertNotIn("notes.txt", props)
+        self.assertNotIn("NoHeaders", props)
+        self.assertNotIn("lib.lib", props)
+
+    def test_props_escapes_special_characters(self) -> None:
+        sha_a = self.commit("A", {
+            "packageupper.txt": "src A/src\n",
+            "A/src/R&D 100%;$x@.cpp": "",
+        })
+        self.set_project([f"dep {url('A', sha_a)}"])
+        self.install()
+
+        props = self.props()
+        xml.dom.minidom.parseString(props)
+        self.assertIn("R&amp;D 100%25%3B%24x%40.cpp", props)
+
+    def test_props_follows_new_files_in_a_local_dependency(self) -> None:
+        sha_a = self.library("A")
+        self.set_project([f"local {url('A', sha_a)}"])
+        self.install()
+        self.assertNotIn("added.cpp", self.props())
+
+        (self.deps() / "A/src/o2/a/added.cpp").write_text("", encoding="utf-8")
+        self.install()
+
+        self.assertIn("added.cpp", self.props())
+
+    def test_clean_rewrites_props_with_only_local_dependencies(self) -> None:
+        sha_a = self.library("A")
+        sha_b = self.library("B")
+        self.set_project([f"local {url('A', sha_a)}", f"dep {url('B', sha_b)}"])
+        self.install()
+        self.assertIn("b.cpp", self.props())
+
+        self.clean()
+
+        props = self.props()
+        self.assertIn("a.cpp", props)
+        self.assertNotIn("b.cpp", props)
+
+    def test_props_is_written_when_there_are_no_dependencies(self) -> None:
+        self.set_project([])
+        self.install()
+
+        props = self.props()
+        xml.dom.minidom.parseString(props)
+        self.assertIn("<AdditionalIncludeDirectories>%(AdditionalIncludeDirectories)", props)
 
 
 class ParseTest(unittest.TestCase):
