@@ -449,7 +449,8 @@ def write_props(
     lines.append("  </ItemGroup>")
     lines.append("</Project>")
 
-    (deps_dir / PROPS_NAME).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    # newline="\n" so the file is the same whichever OS ran the install
+    (deps_dir / PROPS_NAME).write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
     log(f"Wrote {DEPS_NAME}/{PROPS_NAME} ({len(sources)} source files, {len(include_dirs)} include folders)")
 
 
