@@ -82,6 +82,8 @@ Each dependency is copied into its own folder in the project that uses it, under
 ```
 deps/
     deps.props
+    deps.vcxitems
+    deps.vcxitems.filters
     O2Jam/
         packageupper.txt
         include/o2/jam/...
@@ -94,7 +96,7 @@ deps/
 - Each dependency's `packageupper.txt` is copied too, so `local` dependencies can be resolved without fetching
 - `deps/` is meant to be committed to the project's repository, so the project builds and can be read without running PackageUpper
 - PackageUpper owns `deps/` and nothing else in the project: it never writes outside `deps/`
-- `deps.props` is generated for Visual Studio; see below
+- `deps.props`, `deps.vcxitems` and `deps.vcxitems.filters` are generated for Visual Studio; see below
 
 ## Visual Studio
 
@@ -119,13 +121,35 @@ Or edit the `.vcxproj` by hand: add this right after the line that imports `Micr
 ```
 
 - If the project sets its own include directories or libraries, keep `%(AdditionalIncludeDirectories)` and `%(AdditionalDependencies)` in them, which Visual Studio's property pages do by default, so the dependencies' settings still apply
-- The files show up at the top level of the project in Solution Explorer, because filters live in the project's own `.vcxproj.filters`, which PackageUpper doesn't write
+- With `deps.props` alone, the files show up at the top level of the project in Solution Explorer, mixed in with the project's own files: filters live in the project's own `.vcxproj.filters`, which PackageUpper doesn't write. Import `deps.vcxitems` too to keep them apart; see the next section
 - Visual Studio may keep using the old file list after `install` or `clean` while the solution is open. If a build looks for files that are gone, unload and reload the project
+
+### Keeping dependency files apart in Solution Explorer
+
+`install` and `clean` also write `deps/deps.vcxitems` and `deps/deps.vcxitems.filters`. Together they are a *shared items project*: Visual Studio's way to share source files between projects. It lists the same files `deps.props` would, sorted into folders that match `deps/`, one top folder per dependency. Solution Explorer shows it as its own `deps` node, so the project's own node holds only its own files.
+
+The files are still compiled as part of the project, the same way: nothing is built separately and there's no extra library to link. `deps.props` keeps the include paths, libraries and DLL copies, and stops listing the files once `deps.vcxitems` is imported, so a project that imports both compiles each file once. A project that doesn't import it keeps working as before.
+
+Set it up once, after the first install:
+
+1. Add it to the solution: right-click the solution in Solution Explorer, choose **Add > Existing Project...**, and pick `deps\deps.vcxitems`
+2. Reference it from the project: right-click the project's **References**, choose **Add Shared Project Reference...** (in some versions, **Add Reference...** and its **Shared Projects** tab), tick `deps`, and save
+
+Or edit the `.vcxproj` by hand: put the import in the `ImportGroup` labelled `Shared`, which Visual Studio's templates already have, with the path from the `.vcxproj` to `deps/`:
+
+```xml
+<ImportGroup Label="Shared">
+  <Import Project="deps\deps.vcxitems" Label="Shared" />
+</ImportGroup>
+```
+
+- Both files are rewritten on every `install` and `clean`, so files a dependency adds or removes are picked up without editing the project. Their GUIDs come from the project folder's name, so they stay the same from one run to the next
+- Don't add files to the `deps` node in Visual Studio: they would go into `deps.vcxitems`, which the next `install` rewrites
 
 ## Commands
 
-- `install`: resolves the whole tree, then replaces every non-`local` dependency in `deps/` with a fresh copy, removes dependencies that are no longer in the tree, and rewrites `deps/deps.props`
-- `clean`: deletes every non-`local` dependency from `deps/` and rewrites `deps/deps.props` with what is left
+- `install`: resolves the whole tree, then replaces every non-`local` dependency in `deps/` with a fresh copy, removes dependencies that are no longer in the tree, and rewrites `deps/deps.props`, `deps/deps.vcxitems` and `deps/deps.vcxitems.filters`
+- `clean`: deletes every non-`local` dependency from `deps/` and rewrites `deps/deps.props`, `deps/deps.vcxitems` and `deps/deps.vcxitems.filters` with what is left
 
 ## Errors
 
