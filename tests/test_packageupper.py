@@ -101,6 +101,12 @@ class PackageUpperTest(unittest.TestCase):
     def props(self) -> str:
         return (self.deps() / "deps.props").read_text(encoding="utf-8")
 
+    def items(self) -> str:
+        return (self.deps() / "deps.vcxitems").read_text(encoding="utf-8")
+
+    def items_filters(self) -> str:
+        return (self.deps() / "deps.vcxitems.filters").read_text(encoding="utf-8")
+
     def snapshot(self) -> dict:
         files = {}
         for path in sorted(self.deps().rglob("*")):
@@ -370,6 +376,90 @@ class PackageUpperTest(unittest.TestCase):
         props = self.props()
         xml.dom.minidom.parseString(props)
         self.assertIn("<AdditionalIncludeDirectories>%(AdditionalIncludeDirectories)", props)
+
+    # deps.vcxitems -----------------------------------------------------------
+
+    def test_shared_items_project_lists_the_files_and_props_stands_aside(self) -> None:
+        sha_a = self.library("A")
+        self.set_project([f"dep {url('A', sha_a)}"])
+        self.install()
+
+        here = "$(MSBuildThisFileDirectory)"
+        items = self.items()
+        xml.dom.minidom.parseString(items)
+        self.assertIn("<HasSharedItems>true</HasSharedItems>", items)
+        self.assertIn("<PackageUpperSharedItems>true</PackageUpperSharedItems>", items)
+        self.assertIn(f'<ClCompile Include="{here}A\\src\\o2\\a\\a.cpp">', items)
+        self.assertIn("<ObjectFileName>$(IntDir)deps\\A\\src\\o2\\a\\</ObjectFileName>", items)
+        self.assertIn(f'<ClInclude Include="{here}A\\include\\o2\\a\\a.h" />', items)
+
+        # deps.props still lists the files, but only for a project without deps.vcxitems,
+        # so a project that imports both doesn't compile every file twice
+        props = self.props()
+        group = "<ItemGroup Condition=\"'$(PackageUpperSharedItems)'!='true'\">"
+        self.assertIn(group, props)
+        self.assertLess(props.index(group), props.index("a.cpp"))
+        self.assertIn("<AdditionalIncludeDirectories>", props)
+
+    def test_shared_items_filters_follow_the_folders_in_deps(self) -> None:
+        sha_a = self.library("A")
+        sha_b = self.library("B")
+        self.set_project([f"dep {url('A', sha_a)}", f"dep {url('B', sha_b)}"])
+        self.install()
+
+        here = "$(MSBuildThisFileDirectory)"
+        filters = self.items_filters()
+        document = xml.dom.minidom.parseString(filters)
+        defined = set()
+        for element in document.getElementsByTagName("Filter"):
+            if element.getAttribute("Include"):
+                defined.add(element.getAttribute("Include"))
+
+        # one top folder per dependency, and every folder on the way to a file
+        for folder in ("A", "A\\src", "A\\src\\o2", "A\\src\\o2\\a", "A\\include\\o2\\a", "B", "B\\src\\o2\\b"):
+            self.assertIn(folder, defined)
+        self.assertIn(
+            f'<ClCompile Include="{here}A\\src\\o2\\a\\a.cpp">\n      <Filter>A\\src\\o2\\a</Filter>',
+            filters,
+        )
+        self.assertIn(
+            f'<ClInclude Include="{here}B\\include\\o2\\b\\b.h">\n      <Filter>B\\include\\o2\\b</Filter>',
+            filters,
+        )
+        for element in document.getElementsByTagName("Filter"):
+            if not element.getAttribute("Include"):
+                self.assertIn(element.firstChild.data, defined)
+
+    def test_shared_items_files_are_the_same_on_every_install(self) -> None:
+        sha_a = self.library("A")
+        self.set_project([f"dep {url('A', sha_a)}"])
+        self.install()
+        first = (self.items(), self.items_filters())
+
+        self.install()
+
+        # Visual Studio stores the GUIDs, so they must not change between runs
+        self.assertEqual((self.items(), self.items_filters()), first)
+
+    def test_clean_rewrites_shared_items_with_only_local_dependencies(self) -> None:
+        sha_a = self.library("A")
+        sha_b = self.library("B")
+        self.set_project([f"local {url('A', sha_a)}", f"dep {url('B', sha_b)}"])
+        self.install()
+        self.assertIn("b.cpp", self.items())
+
+        self.clean()
+
+        for text in (self.items(), self.items_filters()):
+            self.assertIn("a.cpp", text)
+            self.assertNotIn("b.cpp", text)
+
+    def test_shared_items_are_written_when_there_are_no_dependencies(self) -> None:
+        self.set_project([])
+        self.install()
+
+        xml.dom.minidom.parseString(self.items())
+        xml.dom.minidom.parseString(self.items_filters())
 
     def native_library(self, name: str, extra_lines: list, deps: list = None) -> str:
         """Commits a library whose external has .lib and .dll files for x64 and Win32."""
